@@ -1,13 +1,10 @@
 """
-Baseball competitor price scraper - v3.
+Baseball competitor price scraper - v4.
 
 Changes in this version:
-  - Comet Sports: replaced the theme-specific extractor with a generic one
-    that finds product links and reads the price next to them (their custom
-    theme doesn't use standard Magento markup).
-  - Baseball Outlet: it's a Magento shop like Comet (not Shopify), so it now
-    uses the same generic extractor via stealth mode, discovering its
-    category pages from the homepage menu.
+  - Baseball Outlet: now reads standard Magento product tiles (their product
+    links live under category paths, which v3 wrongly filtered out).
+  - Rate-limit handling: waits and retries once if a site says 429.
 """
 
 import csv
@@ -118,6 +115,12 @@ def get(url, log_status=False):
         try:
             resp = client.get(url, headers=HEADERS, timeout=30)
             time.sleep(DELAY)
+            if resp.status_code == 429:
+                if log_status:
+                    print(f"  [{label}] HTTP 429 (rate limited) - waiting 30s and retrying")
+                time.sleep(30)
+                resp = client.get(url, headers=HEADERS, timeout=30)
+                time.sleep(DELAY)
             if resp.status_code == 200:
                 if log_status:
                     print(f"  [{label}] 200 OK  {url}")
@@ -134,9 +137,40 @@ def get(url, log_status=False):
 # Generic Magento listing extractor (Comet Sports + Baseball Outlet)
 # ---------------------------------------------------------------------------
 def magento_products(soup, base_url):
-    """Find product links (root-level slug.html) and the price next to them."""
+    """Extract products from a Magento listing page.
+
+    Tries the standard Magento product tiles first; if the theme is custom
+    (like Comet's), falls back to a generic scan for root-level product
+    links with a price next to them."""
     domain = urlparse(base_url).netloc
     best = {}
+
+    # 1) standard Magento markup
+    for link in soup.select("a.product-item-link"):
+        href = link.get("href", "").split("?")[0]
+        if not href:
+            continue
+        name = clean_name(link.get_text(" ", strip=True))
+        if len(name) < 5:
+            continue
+        price, container = None, link
+        for _ in range(5):
+            container = container.parent
+            if container is None:
+                break
+            price = clean_price(container.get_text(" ", strip=True))
+            if price is not None:
+                break
+        if price is None:
+            continue
+        url = href if href.startswith("http") else base_url + href
+        current = best.get(url)
+        if current is None or len(name) < len(current[0]):
+            best[url] = (name, price)
+    if best:
+        return [(n, p, u) for u, (n, p) in best.items()]
+
+    # 2) generic fallback (custom themes)
     for link in soup.find_all("a", href=True):
         href = link["href"].split("?")[0]
         parsed = urlparse(href)
@@ -418,7 +452,5 @@ def main():
     write_output(all_rows)
 
 
-if __name__ == "__main__":
-    main()
 if __name__ == "__main__":
     main()
