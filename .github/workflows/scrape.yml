@@ -31,7 +31,7 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run the scraper
-        run: python scraper.py
+        run: python -u scraper.py
 
       - name: Save the results back to the repository
         run: |
