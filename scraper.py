@@ -1,12 +1,13 @@
 """
-Baseball competitor price scraper - v9.
+Baseball competitor price scraper - v10.
 
 Changes in this version:
-  - Browser stealth: removes the automation flags that headless browsers
-    carry (the tell that got every page after the first blocked in v8), and
-    waits up to 25s per page for bot checks to clear before reading it.
-  - Safety net: a site that returns zero products keeps its previous run's
-    data instead of wiping its own column off the dashboard.
+  - Uses real Google Chrome when available (falls back to Chromium). These
+    bot checks fingerprint the browser deeply and real Chrome passes checks
+    that bare Chromium fails.
+  - The safety net now digs through price_history.csv for each site's last
+    good day, so data wiped from the dashboard by earlier failed runs is
+    restored automatically.
 """
 
 import csv
@@ -148,10 +149,14 @@ def _browser_page():
         try:
             from playwright.sync_api import sync_playwright
             pw = sync_playwright().start()
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+            launch_args = ["--disable-blink-features=AutomationControlled"]
+            try:
+                browser = pw.chromium.launch(
+                    headless=True, channel="chrome", args=launch_args)
+                print("  [browser] using real Google Chrome")
+            except Exception:
+                browser = pw.chromium.launch(headless=True, args=launch_args)
+                print("  [browser] using Chromium (Chrome not installed)")
             ctx = browser.new_context(
                 user_agent=HEADERS["User-Agent"],
                 viewport={"width": 1366, "height": 768},
@@ -584,18 +589,30 @@ def write_output(rows):
 
 
 def read_previous_latest():
-    """Rows from the last successful run, grouped by site."""
-    path = Path(__file__).parent / "data" / "latest_prices.csv"
+    """Each site's most recent good day of data, from the latest snapshot
+    and the full history (so data lost to a failed run can be recovered)."""
+    data_dir = Path(__file__).parent / "data"
+    per_site_day = {}          # (site, date) -> rows
+    for filename in ("latest_prices.csv", "price_history.csv"):
+        path = data_dir / filename
+        if not path.exists():
+            continue
+        try:
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    key = (row.get("site", ""), row.get("date", ""))
+                    per_site_day.setdefault(key, []).append(row)
+        except Exception as exc:
+            print(f"  ! could not read {filename}: {exc}")
     by_site = {}
-    if not path.exists():
-        return by_site
-    try:
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                by_site.setdefault(row.get("site", ""), []).append(row)
-    except Exception as exc:
-        print(f"  ! could not read previous data: {exc}")
-    return by_site
+    for (site, day), rows in per_site_day.items():
+        if len(rows) < 5:
+            continue           # a thin day is not a good day
+        best = by_site.get(site)
+        if best is None or day > best[0] or (day == best[0]
+                                             and len(rows) > len(best[1])):
+            by_site[site] = (day, rows)
+    return {site: rows for site, (day, rows) in by_site.items()}
 
 
 def main():
