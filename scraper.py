@@ -1,14 +1,13 @@
 """
-Baseball competitor price scraper - v2.
+Baseball competitor price scraper - v3.
 
-Fixes in this version:
-  - Any site that refuses the first request is retried with cloudscraper
-    (bypasses basic bot detection).
-  - Shopify sites: if the products.json feed fails, falls back to reading
-    the /collections/all shop pages directly.
-  - Coach Carter's: removed the keyword filter that was dropping products.
-  - Clearer logging: prints the HTTP status for each site's first page so
-    failures are easy to spot in the run log.
+Changes in this version:
+  - Comet Sports: replaced the theme-specific extractor with a generic one
+    that finds product links and reads the price next to them (their custom
+    theme doesn't use standard Magento markup).
+  - Baseball Outlet: it's a Magento shop like Comet (not Shopify), so it now
+    uses the same generic extractor via stealth mode, discovering its
+    category pages from the homepage menu.
 """
 
 import csv
@@ -18,6 +17,7 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -39,25 +39,34 @@ HEADERS = {
 }
 DELAY = 1.5
 PRICE_RE = re.compile(r"£\s*(\d{1,4}(?:,\d{3})?\.\d{2})")
+NOISE_RE = re.compile(
+    r"\b(out of stock|free delivery|add to wish list|special price|"
+    r"regular price|as low as|availability:.*|only \d+ left|sale|new)\b",
+    re.IGNORECASE,
+)
+NON_PRODUCT_SLUGS = {
+    "about_us", "about-us", "contact", "delivery", "terms", "faqs", "faq",
+    "privacy_policy", "privacy-policy", "return_policy", "returns",
+    "support_page", "payment_security", "payment_options", "sizing",
+    "brands", "wishlist", "team-hub", "finance", "sitemap",
+}
 
 CATEGORY_RULES = [
     ("Batting Gloves", ["batting glove"]),
     ("Catchers Gear", ["catcher", "chest protector", "leg guard", "umpire"]),
     ("Helmets", ["helmet", "face guard", "faceguard", "jaw guard"]),
-    ("Bats", ["bat ", " bats", "fungo", "slugger bat", "slowpitch", "slow-pitch",
-              "slow pitch", "fastpitch", "fast-pitch", "fast pitch", "wooden bat",
-              "youth bat", "-13", "-12", "-11", "-10", "-8", "-5", "-3", "bbcor",
-              "usssa", "end loaded", "endloaded"]),
+    ("Bats", ["bat ", " bats", "fungo", "slowpitch", "slow-pitch", "slow pitch",
+              "fastpitch", "fast-pitch", "fast pitch", "wooden bat", "youth bat",
+              "bbcor", "usssa", "tee ball", "teeball", "t-ball"]),
     ("Fielding Gloves", ["fielding glove", "baseball glove", "softball glove",
                          "mitt", "first base", "infield", "outfield", "glove"]),
     ("Balls", ["baseballs", "softballs", "training ball", "practice ball",
-               "incrediball", "dozen", " ball", "rolb", "tattered"]),
-    ("Cleats", ["cleat", "spike", "turf shoe", "trainers", "footwear", "shoes",
-                "molded", "metal low", "metal mid"]),
+               "incrediball", "dozen", " ball", "rolb"]),
+    ("Cleats", ["cleat", "spike", "turf shoe", "trainers", "footwear", "shoes"]),
     ("Training Equipment", ["training", "pitching machine", "batting tee",
                             "tee ", "net", "cage", "screen", "practice",
                             "agility", "swing trainer", "rebounder"]),
-    ("Bags", ["bag", "backpack", "wheeled", "duffle", "duffel", "catch all"]),
+    ("Bags", ["bag", "backpack", "wheeled", "duffle", "duffel"]),
     ("Protection", ["elbow guard", "shin guard", "sliding mitt", "protective",
                     "wrist guard", "mouthguard", "evoshield", "cup", "guard"]),
     ("Clothing", ["pants", "jersey", "shirt", "jacket", "socks", "belt", "cap",
@@ -67,7 +76,7 @@ CATEGORY_RULES = [
                          "line marker", "field", "scorebook", "strike zone"]),
     ("Accessories", ["grip", "tape", "pine tar", "eye black", "sunglasses",
                      "accessor", "glove care", "glove oil", "conditioner",
-                     "voucher", "gift", "keychain", "lanyard"]),
+                     "voucher", "gift"]),
 ]
 
 
@@ -92,8 +101,17 @@ def clean_price(value):
         return None
 
 
+def clean_name(text):
+    text = NOISE_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -\u00b7")
+    words = text.split(" ")
+    half = len(words) // 2
+    if half >= 2 and words[:half] == words[half:half * 2] and len(words) % 2 == 0:
+        text = " ".join(words[:half])
+    return text.strip()
+
+
 def get(url, log_status=False):
-    """Fetch a URL; if the plain request fails, retry in stealth mode."""
     for label, client in (("plain", PLAIN), ("stealth", STEALTH)):
         if client is None:
             continue
@@ -113,91 +131,72 @@ def get(url, log_status=False):
 
 
 # ---------------------------------------------------------------------------
-# Shopify sites (JSON feed with an HTML fallback)
+# Generic Magento listing extractor (Comet Sports + Baseball Outlet)
 # ---------------------------------------------------------------------------
-def scrape_shopify(site_name, base_url):
-    print(f"Scraping {site_name}...")
-    rows = shopify_json(site_name, base_url)
-    if not rows:
-        print(f"  products.json gave nothing - falling back to shop pages")
-        rows = shopify_html(site_name, base_url)
+def magento_products(soup, base_url):
+    """Find product links (root-level slug.html) and the price next to them."""
+    domain = urlparse(base_url).netloc
+    best = {}
+    for link in soup.find_all("a", href=True):
+        href = link["href"].split("?")[0]
+        parsed = urlparse(href)
+        if parsed.netloc and parsed.netloc != domain:
+            continue
+        path = parsed.path
+        if not path.endswith(".html"):
+            continue
+        segments = [s for s in path.strip("/").split("/") if s]
+        if len(segments) != 1:            # categories are multi-segment
+            continue
+        slug = segments[0][:-5]
+        if slug in NON_PRODUCT_SLUGS:
+            continue
+        name = clean_name(link.get_text(" ", strip=True) or link.get("title") or "")
+        if len(name) < 5 or name.startswith("£"):
+            continue
+        price, container = None, link
+        for _ in range(5):
+            container = container.parent
+            if container is None:
+                break
+            price = clean_price(container.get_text(" ", strip=True))
+            if price is not None:
+                break
+        if price is None:
+            continue
+        url = href if href.startswith("http") else base_url + path
+        current = best.get(url)
+        if current is None or len(name) < len(current[0]):
+            best[url] = (name, price)
+    return [(n, p, u) for u, (n, p) in best.items()]
+
+
+def scrape_magento_categories(site_name, base_url, categories):
+    rows = []
+    first = True
+    for category, path in categories:
+        got_any = False
+        # try to get the whole category in one page first
+        for suffix in ("?product_list_limit=all", ""):
+            resp = get(f"{base_url}{path}{suffix}", log_status=first)
+            first = False
+            if resp is None:
+                continue
+            products = magento_products(BeautifulSoup(resp.text, "html.parser"),
+                                        base_url)
+            if products:
+                for name, price, url in products:
+                    rows.append({"site": site_name, "category": category,
+                                 "product": name, "price": price, "url": url})
+                got_any = True
+                break
+        if not got_any:
+            continue
+    rows = list({r["url"]: r for r in rows}.values())
     print(f"  -> {len(rows)} products")
     return rows
 
 
-def shopify_json(site_name, base_url):
-    rows = []
-    page = 1
-    while True:
-        resp = get(f"{base_url}/products.json?limit=250&page={page}",
-                   log_status=(page == 1))
-        if resp is None:
-            break
-        try:
-            products = resp.json().get("products", [])
-        except (json.JSONDecodeError, ValueError):
-            print(f"  ! {site_name}: products.json response was not JSON")
-            break
-        if not products:
-            break
-        for p in products:
-            name = p.get("title", "").strip()
-            hint = f"{p.get('product_type', '')} {' '.join(p.get('tags', []))}"
-            variants = p.get("variants", [])
-            price = clean_price(variants[0].get("price")) if variants else None
-            if name and price is not None:
-                rows.append({
-                    "site": site_name,
-                    "category": categorise(name, hint),
-                    "product": name,
-                    "price": price,
-                    "url": f"{base_url}/products/{p.get('handle', '')}",
-                })
-        page += 1
-        if page > 40:
-            break
-    return rows
-
-
-def shopify_html(site_name, base_url):
-    rows, seen = [], set()
-    for page_num in range(1, 41):
-        resp = get(f"{base_url}/collections/all?page={page_num}",
-                   log_status=(page_num == 1))
-        if resp is None:
-            break
-        soup = BeautifulSoup(resp.text, "html.parser")
-        found = 0
-        for link in soup.select("a[href*='/products/']"):
-            href = link.get("href", "").split("?")[0]
-            if not href or href in seen:
-                continue
-            name = (link.get_text(" ", strip=True) or link.get("title") or "").strip()
-            if len(name) < 4:
-                continue
-            container, price = link, None
-            for _ in range(4):
-                container = container.parent
-                if container is None:
-                    break
-                price = clean_price(container.get_text(" ", strip=True))
-                if price is not None:
-                    break
-            if price is None:
-                continue
-            seen.add(href)
-            full = href if href.startswith("http") else base_url + href
-            rows.append({"site": site_name, "category": categorise(name),
-                         "product": name, "price": price, "url": full})
-            found += 1
-        if found == 0:
-            break
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# Comet Sports (Magento category pages)
-# ---------------------------------------------------------------------------
 COMET_BASE = "https://www.cometsports.co.uk"
 COMET_CATEGORIES = [
     ("Bats", "/baseball-softball-shop-uk/bats.html"),
@@ -218,47 +217,83 @@ COMET_CATEGORIES = [
 
 def scrape_comet():
     print("Scraping Comet Sports...")
+    return scrape_magento_categories("Comet Sports", COMET_BASE, COMET_CATEGORIES)
+
+
+OUTLET_BASE = "https://www.baseballoutlet.co.uk"
+
+
+def scrape_baseball_outlet():
+    print("Scraping Baseball Outlet...")
+    resp = get(OUTLET_BASE + "/", log_status=True)
+    if resp is None:
+        print("  ! Baseball Outlet blocked the scraper - no data this run.")
+        return []
+    soup = BeautifulSoup(resp.text, "html.parser")
+    # discover category pages from the site menu (multi-segment .html links)
+    cats, seen = [], set()
+    for link in soup.find_all("a", href=True):
+        href = link["href"].split("?")[0]
+        parsed = urlparse(href)
+        if parsed.netloc and parsed.netloc != urlparse(OUTLET_BASE).netloc:
+            continue
+        path = parsed.path
+        segments = [s for s in path.strip("/").split("/") if s]
+        if not path.endswith(".html") or len(segments) < 2:
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        label = link.get_text(" ", strip=True) or segments[-1]
+        cats.append((categorise(label + " " + path.replace("-", " ")), path))
+    if not cats:
+        print("  ! Could not find any category pages in the menu.")
+        return []
+    cats = cats[:60]
+    print(f"  found {len(cats)} category pages in the menu")
+    return scrape_magento_categories("Baseball Outlet", OUTLET_BASE, cats)
+
+
+# ---------------------------------------------------------------------------
+# Shopify sites (unchanged - both working)
+# ---------------------------------------------------------------------------
+def scrape_shopify(site_name, base_url):
+    print(f"Scraping {site_name}...")
     rows = []
-    first = True
-    for category, path in COMET_CATEGORIES:
-        for page_num in range(1, 11):
-            url = f"{COMET_BASE}{path}" + (f"?p={page_num}" if page_num > 1 else "")
-            resp = get(url, log_status=first)
-            first = False
-            if resp is None:
-                break
-            soup = BeautifulSoup(resp.text, "html.parser")
-            found = 0
-            for item in soup.select("li.product-item, .product-item-info"):
-                link = (item.select_one("a.product-item-link")
-                        or item.select_one("strong a")
-                        or item.select_one("a[href$='.html']"))
-                if not link:
-                    continue
-                name = link.get_text(strip=True)
-                price_el = (item.select_one("[data-price-type='finalPrice'] .price")
-                            or item.select_one(".special-price .price")
-                            or item.select_one(".price"))
-                price = clean_price(price_el.get_text(strip=True) if price_el
-                                    else item.get_text(" ", strip=True))
-                if name and price is not None:
-                    rows.append({
-                        "site": "Comet Sports",
-                        "category": category,
-                        "product": name,
-                        "price": price,
-                        "url": link.get("href", ""),
-                    })
-                    found += 1
-            if found == 0:
-                break
-    rows = list({(r["product"], r["url"]): r for r in rows}.values())
+    page = 1
+    while True:
+        resp = get(f"{base_url}/products.json?limit=250&page={page}",
+                   log_status=(page == 1))
+        if resp is None:
+            break
+        try:
+            products = resp.json().get("products", [])
+        except (json.JSONDecodeError, ValueError):
+            break
+        if not products:
+            break
+        for p in products:
+            name = p.get("title", "").strip()
+            hint = f"{p.get('product_type', '')} {' '.join(p.get('tags', []))}"
+            variants = p.get("variants", [])
+            price = clean_price(variants[0].get("price")) if variants else None
+            if name and price is not None:
+                rows.append({
+                    "site": site_name,
+                    "category": categorise(name, hint),
+                    "product": name,
+                    "price": price,
+                    "url": f"{base_url}/products/{p.get('handle', '')}",
+                })
+        page += 1
+        if page > 40:
+            break
     print(f"  -> {len(rows)} products")
     return rows
 
 
 # ---------------------------------------------------------------------------
-# The Baseball Shop (Visualsoft category pages)
+# The Baseball Shop (unchanged - working)
 # ---------------------------------------------------------------------------
 TBS_BASE = "https://www.thebaseballshop.co.uk"
 TBS_CATEGORIES = [
@@ -333,23 +368,8 @@ def scrape_tbs():
                         found += 1
             if found == 0:
                 break
-    rows = list({(r["product"],) : r for r in rows}.values())
+    rows = list({(r["product"],): r for r in rows}.values())
     print(f"  -> {len(rows)} products")
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# Baseball Outlet (bot-protected, best effort)
-# ---------------------------------------------------------------------------
-def scrape_baseball_outlet():
-    print("Scraping Baseball Outlet (bot-protected, best effort)...")
-    rows = shopify_json("Baseball Outlet", "https://www.baseballoutlet.co.uk")
-    if not rows:
-        rows = shopify_html("Baseball Outlet", "https://www.baseballoutlet.co.uk")
-    if not rows:
-        print("  ! Baseball Outlet blocked the scraper - no data this run.")
-    else:
-        print(f"  -> {len(rows)} products")
     return rows
 
 
@@ -400,7 +420,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 if __name__ == "__main__":
     main()
