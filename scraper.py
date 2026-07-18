@@ -1,11 +1,12 @@
 """
-Baseball competitor price scraper - v7.
+Baseball competitor price scraper - v8.
 
 Changes in this version:
-  - Baseball Outlet: full recursive crawl with a 500-page budget. Their menu
-    alone has 200+ category pages, so earlier versions ran out before
-    reaching balls, batting gloves, helmets and the other later sections.
-  - Progress is logged every 50 pages so long runs are visibly alive.
+  - Comet Sports and Baseball Outlet are now fetched with a real browser
+    engine (Playwright/Chromium). Their bot protection began serving fake
+    "success" pages to script-based requests; a real browser passes the
+    JavaScript checks like a normal visitor. The other three sites keep the
+    fast direct method that has been reliable throughout.
 """
 
 import csv
@@ -135,6 +136,61 @@ def get(url, log_status=False):
 
 
 # ---------------------------------------------------------------------------
+# Real-browser fetching (Comet Sports + Baseball Outlet)
+# ---------------------------------------------------------------------------
+_BROWSER_STATE = {"page": None, "failed": False}
+
+
+def _browser_page():
+    if _BROWSER_STATE["failed"]:
+        return None
+    if _BROWSER_STATE["page"] is None:
+        try:
+            from playwright.sync_api import sync_playwright
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1366, "height": 768},
+                locale="en-GB",
+            )
+            page = ctx.new_page()
+            page.route("**/*", lambda route: route.abort()
+                       if route.request.resource_type in ("image", "font", "media")
+                       else route.continue_())
+            _BROWSER_STATE["page"] = page
+        except Exception as exc:
+            print(f"  [browser] could not start: {exc}")
+            _BROWSER_STATE["failed"] = True
+            return None
+    return _BROWSER_STATE["page"]
+
+
+def get_html(url, log_status=False):
+    """Fetch a page with the real browser; fall back to direct requests."""
+    page = _browser_page()
+    if page is not None:
+        try:
+            page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            time.sleep(2)
+            html = page.content()
+            if "Just a moment" in html or "Checking your browser" in html:
+                time.sleep(6)          # let the bot check finish and redirect
+                html = page.content()
+            if log_status:
+                note = "" if "\u00a3" in html or "£" in html else \
+                       "  (no prices on page - possible bot-check screen)"
+                print(f"  [browser] loaded  {url}{note}")
+            time.sleep(DELAY)
+            return html
+        except Exception as exc:
+            if log_status:
+                print(f"  [browser] error: {exc}  {url}")
+    resp = get(url, log_status=log_status)
+    return resp.text if resp is not None else None
+
+
+# ---------------------------------------------------------------------------
 # Generic Magento listing extractor (Comet Sports + Baseball Outlet)
 # ---------------------------------------------------------------------------
 def magento_products(soup, base_url):
@@ -225,11 +281,11 @@ def scrape_magento_categories(site_name, base_url, categories):
     for category, path in categories:
         base_products = None
         for suffix in ("?product_list_limit=all", ""):
-            resp = get(f"{base_url}{path}{suffix}", log_status=first)
+            html = get_html(f"{base_url}{path}{suffix}", log_status=first)
             first = False
-            if resp is None:
+            if html is None:
                 continue
-            products = magento_products(BeautifulSoup(resp.text, "html.parser"),
+            products = magento_products(BeautifulSoup(html, "html.parser"),
                                         base_url)
             if products:
                 base_products = products
@@ -240,11 +296,11 @@ def scrape_magento_categories(site_name, base_url, categories):
         # extra pages in case the site ignored the show-all setting
         if len(base_products) >= 18:
             for page_num in range(2, 11):
-                resp = get(f"{base_url}{path}?p={page_num}")
-                if resp is None:
+                html = get_html(f"{base_url}{path}?p={page_num}")
+                if html is None:
                     break
                 products = magento_products(
-                    BeautifulSoup(resp.text, "html.parser"), base_url)
+                    BeautifulSoup(html, "html.parser"), base_url)
                 if not products or add(products, category) == 0:
                     break
     out = list(rows.values())
@@ -306,11 +362,11 @@ def outlet_category_links(soup):
 
 def scrape_baseball_outlet():
     print("Scraping Baseball Outlet (recursive crawl)...")
-    resp = get(OUTLET_BASE + "/", log_status=True)
-    if resp is None:
+    html = get_html(OUTLET_BASE + "/", log_status=True)
+    if html is None:
         print("  ! Baseball Outlet blocked the scraper - no data this run.")
         return []
-    home = BeautifulSoup(resp.text, "html.parser")
+    home = BeautifulSoup(html, "html.parser")
     queue = sorted(outlet_category_links(home))
     if not queue:
         print("  ! Could not find any category pages in the menu.")
@@ -340,10 +396,10 @@ def scrape_baseball_outlet():
                   f"{len(rows)} products so far, {len(queue)} pages queued")
         products, page_soup = None, None
         for suffix in ("?product_list_limit=all", ""):
-            resp = get(f"{OUTLET_BASE}{path}{suffix}")
-            if resp is None:
+            html = get_html(f"{OUTLET_BASE}{path}{suffix}")
+            if html is None:
                 continue
-            page_soup = BeautifulSoup(resp.text, "html.parser")
+            page_soup = BeautifulSoup(html, "html.parser")
             found = magento_products(page_soup, OUTLET_BASE)
             if found:
                 products = found
@@ -357,11 +413,11 @@ def scrape_baseball_outlet():
         add(products)
         if len(products) >= 18:
             for page_num in range(2, 11):
-                resp = get(f"{OUTLET_BASE}{path}?p={page_num}")
-                if resp is None:
+                html = get_html(f"{OUTLET_BASE}{path}?p={page_num}")
+                if html is None:
                     break
                 more = magento_products(
-                    BeautifulSoup(resp.text, "html.parser"), OUTLET_BASE)
+                    BeautifulSoup(html, "html.parser"), OUTLET_BASE)
                 if not more or add(more) == 0:
                     break
     out = list(rows.values())
