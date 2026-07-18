@@ -1,13 +1,11 @@
 """
-Baseball competitor price scraper - v5.
+Baseball competitor price scraper - v7.
 
 Changes in this version:
-  - Baseball Outlet: menu scan cap raised from 60 to 200 category pages (the
-    balls section sits deep in their menu and was being cut off).
-  - Pagination: if a category ignores the show-all setting, extra pages are
-    fetched until no new products appear.
-  - Categories: each product is now categorised by its own name first, with
-    the page's category as the fallback.
+  - Baseball Outlet: full recursive crawl with a 500-page budget. Their menu
+    alone has 200+ category pages, so earlier versions ran out before
+    reaching balls, batting gloves, helmets and the other later sections.
+  - Progress is logged every 50 pages so long runs are visibly alive.
 """
 
 import csv
@@ -278,37 +276,98 @@ def scrape_comet():
 
 
 OUTLET_BASE = "https://www.baseballoutlet.co.uk"
+OUTLET_PAGE_BUDGET = 500
 
 
-def scrape_baseball_outlet():
-    print("Scraping Baseball Outlet...")
-    resp = get(OUTLET_BASE + "/", log_status=True)
-    if resp is None:
-        print("  ! Baseball Outlet blocked the scraper - no data this run.")
-        return []
-    soup = BeautifulSoup(resp.text, "html.parser")
-    # discover category pages from the site menu (multi-segment .html links)
-    cats, seen = [], set()
-    for link in soup.find_all("a", href=True):
-        href = link["href"].split("?")[0]
+def outlet_category_links(soup):
+    """Category links on a page: same-domain, multi-segment .html, excluding
+    links that are product tiles on this page."""
+    domain = urlparse(OUTLET_BASE).netloc
+    product_hrefs = set()
+    for a in soup.select("a.product-item-link"):
+        href = a.get("href", "").split("?")[0]
+        product_hrefs.add(href)
+        product_hrefs.add(urlparse(href).path)
+    links = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].split("?")[0]
         parsed = urlparse(href)
-        if parsed.netloc and parsed.netloc != urlparse(OUTLET_BASE).netloc:
+        if parsed.netloc and parsed.netloc != domain:
             continue
         path = parsed.path
         segments = [s for s in path.strip("/").split("/") if s]
         if not path.endswith(".html") or len(segments) < 2:
             continue
-        if path in seen:
+        if href in product_hrefs or path in product_hrefs:
             continue
-        seen.add(path)
-        label = link.get_text(" ", strip=True) or segments[-1]
-        cats.append((categorise(label + " " + path.replace("-", " ")), path))
-    if not cats:
+        links.add(path)
+    return links
+
+
+def scrape_baseball_outlet():
+    print("Scraping Baseball Outlet (recursive crawl)...")
+    resp = get(OUTLET_BASE + "/", log_status=True)
+    if resp is None:
+        print("  ! Baseball Outlet blocked the scraper - no data this run.")
+        return []
+    home = BeautifulSoup(resp.text, "html.parser")
+    queue = sorted(outlet_category_links(home))
+    if not queue:
         print("  ! Could not find any category pages in the menu.")
         return []
-    cats = cats[:200]
-    print(f"  found {len(cats)} category pages in the menu")
-    return scrape_magento_categories("Baseball Outlet", OUTLET_BASE, cats)
+    print(f"  starting from {len(queue)} category pages found in the menu")
+
+    rows, visited = {}, set()
+
+    def add(products):
+        new = 0
+        for name, price, url in products:
+            if url in rows:
+                continue
+            cat = categorise(name)
+            rows[url] = {"site": "Baseball Outlet", "category": cat,
+                         "product": name, "price": price, "url": url}
+            new += 1
+        return new
+
+    while queue and len(visited) < OUTLET_PAGE_BUDGET:
+        path = queue.pop(0)
+        if path in visited:
+            continue
+        visited.add(path)
+        if len(visited) % 50 == 0:
+            print(f"  ...{len(visited)} pages crawled, "
+                  f"{len(rows)} products so far, {len(queue)} pages queued")
+        products, page_soup = None, None
+        for suffix in ("?product_list_limit=all", ""):
+            resp = get(f"{OUTLET_BASE}{path}{suffix}")
+            if resp is None:
+                continue
+            page_soup = BeautifulSoup(resp.text, "html.parser")
+            found = magento_products(page_soup, OUTLET_BASE)
+            if found:
+                products = found
+                break
+        if page_soup is not None:
+            for link in outlet_category_links(page_soup):
+                if link not in visited:
+                    queue.append(link)
+        if not products:
+            continue
+        add(products)
+        if len(products) >= 18:
+            for page_num in range(2, 11):
+                resp = get(f"{OUTLET_BASE}{path}?p={page_num}")
+                if resp is None:
+                    break
+                more = magento_products(
+                    BeautifulSoup(resp.text, "html.parser"), OUTLET_BASE)
+                if not more or add(more) == 0:
+                    break
+    out = list(rows.values())
+    print(f"  crawled {len(visited)} pages")
+    print(f"  -> {len(out)} products")
+    return out
 
 
 # ---------------------------------------------------------------------------
