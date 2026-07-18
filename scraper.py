@@ -1,12 +1,12 @@
 """
-Baseball competitor price scraper - v8.
+Baseball competitor price scraper - v9.
 
 Changes in this version:
-  - Comet Sports and Baseball Outlet are now fetched with a real browser
-    engine (Playwright/Chromium). Their bot protection began serving fake
-    "success" pages to script-based requests; a real browser passes the
-    JavaScript checks like a normal visitor. The other three sites keep the
-    fast direct method that has been reliable throughout.
+  - Browser stealth: removes the automation flags that headless browsers
+    carry (the tell that got every page after the first blocked in v8), and
+    waits up to 25s per page for bot checks to clear before reading it.
+  - Safety net: a site that returns zero products keeps its previous run's
+    data instead of wiping its own column off the dashboard.
 """
 
 import csv
@@ -148,15 +148,22 @@ def _browser_page():
         try:
             from playwright.sync_api import sync_playwright
             pw = sync_playwright().start()
-            browser = pw.chromium.launch(headless=True)
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
             ctx = browser.new_context(
                 user_agent=HEADERS["User-Agent"],
                 viewport={"width": 1366, "height": 768},
                 locale="en-GB",
             )
             page = ctx.new_page()
+            page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', "
+                "{get: () => undefined});"
+            )
             page.route("**/*", lambda route: route.abort()
-                       if route.request.resource_type in ("image", "font", "media")
+                       if route.request.resource_type == "image"
                        else route.continue_())
             _BROWSER_STATE["page"] = page
         except Exception as exc:
@@ -171,17 +178,18 @@ def get_html(url, log_status=False):
     page = _browser_page()
     if page is not None:
         try:
-            page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            time.sleep(2)
-            html = page.content()
-            if "Just a moment" in html or "Checking your browser" in html:
-                time.sleep(6)          # let the bot check finish and redirect
+            page.goto(url, timeout=60000, wait_until="commit")
+            html, waited = "", 0
+            for waited in range(1, 26):
+                time.sleep(1)
                 html = page.content()
+                if "product-item" in html or "£" in html or "\u00a3" in html:
+                    break                     # real storefront content is in
             if log_status:
-                note = "" if "\u00a3" in html or "£" in html else \
-                       "  (no prices on page - possible bot-check screen)"
-                print(f"  [browser] loaded  {url}{note}")
-            time.sleep(DELAY)
+                real = "product-item" in html or "£" in html
+                note = "" if real else "  (no storefront content after 25s)"
+                print(f"  [browser] loaded in {waited}s  {url}{note}")
+            time.sleep(DELAY + 1.5)           # extra politeness between pages
             return html
         except Exception as exc:
             if log_status:
@@ -556,7 +564,8 @@ def write_output(rows):
 
     rows = sorted(rows, key=lambda r: (r["category"], r["product"].lower(), r["site"]))
     for r in rows:
-        r["date"] = today
+        if not r.get("date"):
+            r["date"] = today
 
     for path in (out_dir / f"prices_{today}.csv", out_dir / "latest_prices.csv"):
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
@@ -574,15 +583,46 @@ def write_output(rows):
     print(f"\nWrote {len(rows)} total rows to the data folder.")
 
 
+def read_previous_latest():
+    """Rows from the last successful run, grouped by site."""
+    path = Path(__file__).parent / "data" / "latest_prices.csv"
+    by_site = {}
+    if not path.exists():
+        return by_site
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                by_site.setdefault(row.get("site", ""), []).append(row)
+    except Exception as exc:
+        print(f"  ! could not read previous data: {exc}")
+    return by_site
+
+
 def main():
+    results = {
+        "Baseball & Softball Shop": scrape_shopify(
+            "Baseball & Softball Shop", "https://www.baseballandsoftball.co.uk"),
+        "Coach Carter's": scrape_shopify(
+            "Coach Carter's", "https://coachcarterssports.co.uk"),
+        "Comet Sports": scrape_comet(),
+        "The Baseball Shop": scrape_tbs(),
+        "Baseball Outlet": scrape_baseball_outlet(),
+    }
+
+    previous = read_previous_latest()
     all_rows = []
-    all_rows += scrape_shopify("Baseball & Softball Shop",
-                               "https://www.baseballandsoftball.co.uk")
-    all_rows += scrape_shopify("Coach Carter's",
-                               "https://coachcarterssports.co.uk")
-    all_rows += scrape_comet()
-    all_rows += scrape_tbs()
-    all_rows += scrape_baseball_outlet()
+    for site, rows in results.items():
+        old_rows = previous.get(site, [])
+        # a site that collapses to a fraction of its previous size kept its
+        # last good data (site redesigns and bot blocks look like this)
+        if old_rows and len(rows) < max(5, len(old_rows) // 4):
+            print(f"! {site}: only {len(rows)} products this run "
+                  f"(previously {len(old_rows)}) - keeping previous data")
+            for r in old_rows:
+                r["price"] = float(r["price"])
+            all_rows += old_rows
+        else:
+            all_rows += rows
 
     if not all_rows:
         print("No data collected at all - something is wrong upstream.")
