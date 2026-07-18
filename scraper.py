@@ -1,10 +1,13 @@
 """
-Baseball competitor price scraper - v4.
+Baseball competitor price scraper - v5.
 
 Changes in this version:
-  - Baseball Outlet: now reads standard Magento product tiles (their product
-    links live under category paths, which v3 wrongly filtered out).
-  - Rate-limit handling: waits and retries once if a site says 429.
+  - Baseball Outlet: menu scan cap raised from 60 to 200 category pages (the
+    balls section sits deep in their menu and was being cut off).
+  - Pagination: if a category ignores the show-all setting, extra pages are
+    fetched until no new products appear.
+  - Categories: each product is now categorised by its own name first, with
+    the page's category as the fallback.
 """
 
 import csv
@@ -206,11 +209,23 @@ def magento_products(soup, base_url):
 
 
 def scrape_magento_categories(site_name, base_url, categories):
-    rows = []
+    rows = {}
     first = True
+
+    def add(products, page_category):
+        new = 0
+        for name, price, url in products:
+            if url in rows:
+                continue
+            own = categorise(name)
+            rows[url] = {"site": site_name,
+                         "category": own if own != "Other" else page_category,
+                         "product": name, "price": price, "url": url}
+            new += 1
+        return new
+
     for category, path in categories:
-        got_any = False
-        # try to get the whole category in one page first
+        base_products = None
         for suffix in ("?product_list_limit=all", ""):
             resp = get(f"{base_url}{path}{suffix}", log_status=first)
             first = False
@@ -219,16 +234,24 @@ def scrape_magento_categories(site_name, base_url, categories):
             products = magento_products(BeautifulSoup(resp.text, "html.parser"),
                                         base_url)
             if products:
-                for name, price, url in products:
-                    rows.append({"site": site_name, "category": category,
-                                 "product": name, "price": price, "url": url})
-                got_any = True
+                base_products = products
                 break
-        if not got_any:
+        if not base_products:
             continue
-    rows = list({r["url"]: r for r in rows}.values())
-    print(f"  -> {len(rows)} products")
-    return rows
+        add(base_products, category)
+        # extra pages in case the site ignored the show-all setting
+        if len(base_products) >= 18:
+            for page_num in range(2, 11):
+                resp = get(f"{base_url}{path}?p={page_num}")
+                if resp is None:
+                    break
+                products = magento_products(
+                    BeautifulSoup(resp.text, "html.parser"), base_url)
+                if not products or add(products, category) == 0:
+                    break
+    out = list(rows.values())
+    print(f"  -> {len(out)} products")
+    return out
 
 
 COMET_BASE = "https://www.cometsports.co.uk"
@@ -283,7 +306,7 @@ def scrape_baseball_outlet():
     if not cats:
         print("  ! Could not find any category pages in the menu.")
         return []
-    cats = cats[:60]
+    cats = cats[:200]
     print(f"  found {len(cats)} category pages in the menu")
     return scrape_magento_categories("Baseball Outlet", OUTLET_BASE, cats)
 
