@@ -5,6 +5,11 @@ on:
     - cron: "0 6 * * *"   # every day at 6:00 AM UK time (7:00 in summer)
   workflow_dispatch:        # lets you run it manually with a button
 
+# never let two scrapes run at the same time - a second one waits its turn
+concurrency:
+  group: price-scrape
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -32,5 +37,10 @@ jobs:
           git config user.email "actions@github.com"
           git add data/
           git diff --cached --quiet || git commit -m "Price data $(date +%F)"
-          git pull --rebase origin main
-          git push
+          n=0
+          until git push; do
+            n=$((n+1))
+            if [ $n -gt 3 ]; then echo "Giving up after 3 attempts"; exit 1; fi
+            echo "Push rejected - syncing with the repository and retrying ($n/3)"
+            git pull --rebase -X theirs origin main
+          done
