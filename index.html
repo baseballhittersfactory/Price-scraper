@@ -133,11 +133,13 @@ async function loadCSV(path){
 }
 
 const gbp = (v) => "£" + Number(v).toFixed(2);
+const slugOf = (u) => { try { return new URL(u).pathname.replace(/\/$/,"").split("/").pop(); } catch(e){ return u; } };
+const keyOf = (r) => r.site + "|" + slugOf(r.url);
 const esc = (s) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;");
 
 function rowHTML(r){
-  const on = favs.items.has(r.url);
-  const prev = prevMap[r.url];
+  const on = favs.items.has(keyOf(r)) || favs.items.has(r.url);
+  const prev = prevMap[keyOf(r)];
   let delta = "";
   if (prev != null){
     const d = Number(r.price) - prev;
@@ -147,7 +149,7 @@ function rowHTML(r){
     }
   }
   return `<tr>
-    <td class="starcell"><span class="star ${on ? "on" : ""}" data-url="${esc(r.url)}">${on ? "★" : "☆"}</span></td>
+    <td class="starcell"><span class="star ${on ? "on" : ""}" data-url="${esc(keyOf(r))}">${on ? "★" : "☆"}</span></td>
     <td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.product)}</a></td>
     <td class="price mono">${gbp(r.price)}${delta}</td>
     <td class="site">${esc(r.site)}</td>
@@ -196,7 +198,7 @@ function renderAll(){
 
 function renderFav(){
   const board = document.getElementById("board");
-  const starred = rows.filter(r => favs.items.has(r.url));
+  const starred = rows.filter(r => favs.items.has(keyOf(r)) || favs.items.has(r.url));
   const favCats = orderedCats().filter(c => favs.cats.has(c));
   if (!starred.length && !favCats.length){
     board.innerHTML = `<div class="empty">Your board is empty so far.<br><br>
@@ -232,14 +234,14 @@ function renderSearch(q){
 }
 
 function inFavScope(r){
-  return favs.items.has(r.url) || favs.cats.has(r.category);
+  return favs.items.has(keyOf(r)) || favs.items.has(r.url) || favs.cats.has(r.category);
 }
 
 function renderChanges(){
   const scope = view === "fav" ? rows.filter(inFavScope) : rows;
   const changes = [];
   for (const r of scope){
-    const prev = prevMap[r.url];
+    const prev = prevMap[keyOf(r)];
     if (prev == null) continue;
     const d = Number(r.price) - prev;
     if (Math.abs(d) >= 0.005) changes.push({ ...r, from: prev, to: Number(r.price) });
@@ -299,7 +301,7 @@ document.addEventListener("click", (e) => {
   }
   try {
     for (const r of await loadCSV("data/previous_prices.csv"))
-      prevMap[r.url] = Number(r.price);
+      prevMap[keyOf(r)] = Number(r.price);
   } catch (e) {}
 
   byCat = {};
