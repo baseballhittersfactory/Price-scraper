@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Price Scoreboard</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&display=swap');
+  :root {
+    --bg:#101613; --panel:#182019; --line:#2A342C; --text:#E8EAE4;
+    --muted:#8A968C; --amber:#FFB742; --green:#5DD98A; --red:#FF6B5E;
+  }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--text); font-family:system-ui, sans-serif; }
+  .head-font { font-family:'Barlow Condensed','Arial Narrow',sans-serif; text-transform:uppercase; letter-spacing:.05em; }
+  .mono { font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace; font-variant-numeric:tabular-nums; }
+  header { padding:16px 20px 12px; border-bottom:2px solid var(--line); }
+  h1 { font-size:28px; line-height:1; font-weight:700; }
+  h1 span { color:var(--amber); }
+  .sub { color:var(--muted); font-size:12px; margin-top:5px; }
+  .controls { padding:12px 20px 4px; display:flex; flex-direction:column; gap:10px; }
+  .views { display:flex; gap:8px; }
+  .view-btn { flex:1; border:1px solid var(--line); background:var(--panel); color:var(--muted);
+    border-radius:8px; padding:9px 10px; font-size:14px; cursor:pointer; }
+  .view-btn.active { border-color:var(--amber); color:var(--amber); }
+  #search { width:100%; background:var(--panel); border:1px solid var(--line); color:var(--text);
+    border-radius:8px; padding:10px 12px; font-size:15px; outline:none; }
+  main { padding:12px 20px 20px; }
+  .changes { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:14px; }
+  .changes h2 { font-size:16px; font-weight:600; margin-bottom:4px; }
+  .change-row { font-size:13px; padding:5px 0; border-top:1px solid var(--line); display:flex; flex-wrap:wrap; gap:6px 10px; align-items:baseline; }
+  .change-row:first-of-type { border-top:none; }
+  .drop { color:var(--green); } .rise { color:var(--red); }
+  details.cat { border:1px solid var(--line); border-radius:10px; background:var(--panel); margin-bottom:10px; overflow:hidden; }
+  details.cat > summary { list-style:none; cursor:pointer; padding:11px 14px; display:flex; gap:10px; align-items:baseline; }
+  details.cat > summary::-webkit-details-marker { display:none; }
+  .cat-name { font-size:18px; font-weight:600; color:var(--amber); flex:1; }
+  .cat-count { color:var(--muted); font-size:12px; }
+  .star { cursor:pointer; color:var(--muted); font-size:17px; line-height:1; user-select:none; padding:2px 6px; }
+  .star.on { color:var(--amber); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td { padding:6px 8px; border-top:1px solid var(--line); vertical-align:top; }
+  td.starcell { width:30px; text-align:center; }
+  td.price { text-align:right; color:var(--amber); white-space:nowrap; }
+  td.site { color:var(--muted); white-space:nowrap; font-size:11px; }
+  .delta { font-size:11px; display:block; }
+  a { color:inherit; text-decoration:none; }
+  .section-title { font-size:18px; font-weight:600; color:var(--amber); margin:4px 0 8px; }
+  .fav-block { border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:10px 4px; margin-bottom:14px; }
+  .empty { border:1px dashed var(--line); border-radius:10px; padding:30px 16px; text-align:center; color:var(--muted); font-size:14px; }
+  .note { color:var(--muted); font-size:12px; padding:6px 2px; }
+  footer { padding:0 20px 26px; color:var(--muted); font-size:12px; }
+  @media (max-width:600px){ td.site{display:none} }
+</style>
+</head>
+<body>
+<header>
+  <h1 class="head-font">Price <span>Scoreboard</span></h1>
+  <div class="sub" id="summary">Loading data…</div>
+</header>
+
+<div class="controls" style="display:none" id="controls">
+  <div class="views">
+    <button class="view-btn" id="viewFav">★ My board</button>
+    <button class="view-btn" id="viewAll">All products</button>
+  </div>
+  <input id="search" placeholder="Search all products… e.g. Rawlings ROLB1">
+</div>
+
+<main>
+  <section class="changes" id="changes" style="display:none">
+    <h2 class="head-font" id="changesTitle">Price changes since previous run</h2>
+    <div id="changeList"></div>
+  </section>
+  <div id="board"><div class="empty">Loading the latest prices…</div></div>
+</main>
+
+<footer>
+  Tap ☆ on any product or category to add it to My board. Favourites are
+  remembered on this device. Data refreshes automatically each morning.
+</footer>
+
+<script>
+const CATEGORY_ORDER = ["Bats","Balls","Batting Gloves","Fielding Gloves","Helmets",
+  "Catchers Gear","Cleats","Training Equipment","Protection","Bags","Clothing",
+  "Field Equipment","Accessories","Other"];
+const SEARCH_CAP = 300;
+const FAV_KEY = "psb:favs";
+
+let rows = [], prevMap = {}, byCat = {}, view = "all";
+let favs = { items: new Set(), cats: new Set() };
+
+try {
+  const saved = JSON.parse(localStorage.getItem(FAV_KEY) || "{}");
+  favs.items = new Set(saved.items || []);
+  favs.cats = new Set(saved.cats || []);
+} catch (e) {}
+
+function saveFavs(){
+  try {
+    localStorage.setItem(FAV_KEY, JSON.stringify({
+      items: [...favs.items], cats: [...favs.cats]
+    }));
+  } catch (e) {}
+}
+
+function parseCSV(text){
+  text = text.replace(/^\uFEFF/, "");
+  const out = []; let row = [], field = "", inQ = false;
+  for (let i = 0; i < text.length; i++){
+    const c = text[i];
+    if (inQ){
+      if (c === '"' && text[i+1] === '"'){ field += '"'; i++; }
+      else if (c === '"'){ inQ = false; }
+      else field += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ','){ row.push(field); field = ""; }
+    else if (c === '\n' || c === '\r'){
+      if (field !== "" || row.length){ row.push(field); out.push(row); row = []; field = ""; }
+      if (c === '\r' && text[i+1] === '\n') i++;
+    } else field += c;
+  }
+  if (field !== "" || row.length){ row.push(field); out.push(row); }
+  const header = out.shift() || [];
+  return out.filter(r => r.length === header.length)
+            .map(r => Object.fromEntries(header.map((h, i) => [h.trim(), r[i]])));
+}
+
+async function loadCSV(path){
+  const resp = await fetch(path + "?t=" + Date.now());
+  if (!resp.ok) throw new Error(path + " -> HTTP " + resp.status);
+  return parseCSV(await resp.text());
+}
+
+const gbp = (v) => "£" + Number(v).toFixed(2);
+const esc = (s) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;");
+
+function rowHTML(r){
+  const on = favs.items.has(r.url);
+  const prev = prevMap[r.url];
+  let delta = "";
+  if (prev != null){
+    const d = Number(r.price) - prev;
+    if (Math.abs(d) >= 0.005){
+      const cls = d < 0 ? "drop" : "rise";
+      delta = `<span class="delta mono ${cls}">${d < 0 ? "▼" : "▲"} ${gbp(Math.abs(d))}</span>`;
+    }
+  }
+  return `<tr>
+    <td class="starcell"><span class="star ${on ? "on" : ""}" data-url="${esc(r.url)}">${on ? "★" : "☆"}</span></td>
+    <td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.product)}</a></td>
+    <td class="price mono">${gbp(r.price)}${delta}</td>
+    <td class="site">${esc(r.site)}</td>
+  </tr>`;
+}
+
+const tableHTML = (list) => `<table>${list.map(rowHTML).join("")}</table>`;
+
+function catDetailsHTML(cat, open){
+  const on = favs.cats.has(cat);
+  return `
+    <details class="cat" data-cat="${esc(cat)}" ${open ? "open" : ""}>
+      <summary>
+        <span class="star ${on ? "on" : ""}" data-cat-star="${esc(cat)}">${on ? "★" : "☆"}</span>
+        <span class="cat-name head-font">${esc(cat)}</span>
+        <span class="cat-count">${byCat[cat].length} products</span>
+      </summary>
+      <div class="slot"></div>
+    </details>`;
+}
+
+function wireDetails(root){
+  root.querySelectorAll("details.cat").forEach(d => {
+    const fill = () => {
+      const slot = d.querySelector(".slot");
+      if (d.open && !slot.dataset.built){
+        slot.innerHTML = tableHTML(byCat[d.dataset.cat]);
+        slot.dataset.built = "1";
+      }
+    };
+    d.addEventListener("toggle", fill);
+    fill();
+  });
+}
+
+function orderedCats(){
+  return Object.keys(byCat)
+    .sort((a, b) => CATEGORY_ORDER.indexOf(a) - CATEGORY_ORDER.indexOf(b));
+}
+
+function renderAll(){
+  const board = document.getElementById("board");
+  board.innerHTML = orderedCats().map(c => catDetailsHTML(c, false)).join("");
+  wireDetails(board);
+}
+
+function renderFav(){
+  const board = document.getElementById("board");
+  const starred = rows.filter(r => favs.items.has(r.url));
+  const favCats = orderedCats().filter(c => favs.cats.has(c));
+  if (!starred.length && !favCats.length){
+    board.innerHTML = `<div class="empty">Your board is empty so far.<br><br>
+      Switch to <b>All products</b> and tap the ☆ next to any product you sell,
+      or star a whole category - they'll appear here.</div>`;
+    return;
+  }
+  let html = "";
+  if (starred.length){
+    html += `<div class="fav-block">
+      <div class="section-title head-font" style="padding:0 8px">★ Starred products</div>
+      ${tableHTML(starred)}</div>`;
+  }
+  html += favCats.map(c => catDetailsHTML(c, true)).join("");
+  board.innerHTML = html;
+  wireDetails(board);
+}
+
+function renderSearch(q){
+  const board = document.getElementById("board");
+  q = q.toLowerCase();
+  const hits = [];
+  for (const r of rows){
+    if (r.product.toLowerCase().includes(q) || r.site.toLowerCase().includes(q)){
+      hits.push(r);
+      if (hits.length > SEARCH_CAP) break;
+    }
+  }
+  board.innerHTML = hits.length
+    ? tableHTML(hits.slice(0, SEARCH_CAP)) +
+      (hits.length > SEARCH_CAP ? `<div class="note">Showing the first ${SEARCH_CAP} matches - keep typing to narrow down.</div>` : "")
+    : '<div class="empty">Nothing matches that search.</div>';
+}
+
+function inFavScope(r){
+  return favs.items.has(r.url) || favs.cats.has(r.category);
+}
+
+function renderChanges(){
+  const scope = view === "fav" ? rows.filter(inFavScope) : rows;
+  const changes = [];
+  for (const r of scope){
+    const prev = prevMap[r.url];
+    if (prev == null) continue;
+    const d = Number(r.price) - prev;
+    if (Math.abs(d) >= 0.005) changes.push({ ...r, from: prev, to: Number(r.price) });
+  }
+  const panel = document.getElementById("changes");
+  if (!changes.length){ panel.style.display = "none"; return; }
+  changes.sort((x, y) => (x.to - x.from) - (y.to - y.from));
+  panel.style.display = "";
+  document.getElementById("changesTitle").textContent =
+    view === "fav" ? "Price changes on my board" : "Price changes since previous run";
+  document.getElementById("changeList").innerHTML = changes.slice(0, 50).map(c => `
+    <div class="change-row">
+      <span class="${c.to < c.from ? "drop" : "rise"} mono">${c.to < c.from ? "▼" : "▲"} ${gbp(c.from)} → ${gbp(c.to)}</span>
+      <a href="${esc(c.url)}" target="_blank" rel="noreferrer">${esc(c.product)}</a>
+      <span style="color:var(--muted)">${esc(c.site)}</span>
+    </div>`).join("")
+    + (changes.length > 50 ? `<div class="note">${changes.length - 50} more changes not shown.</div>` : "");
+}
+
+function setView(v){
+  view = v;
+  document.getElementById("viewFav").classList.toggle("active", v === "fav");
+  document.getElementById("viewAll").classList.toggle("active", v === "all");
+  document.getElementById("search").value = "";
+  renderChanges();
+  (v === "fav" ? renderFav : renderAll)();
+}
+
+// one delegated click handler for every star on the page
+document.addEventListener("click", (e) => {
+  const el = e.target.closest(".star");
+  if (!el) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (el.dataset.url){
+    const u = el.dataset.url;
+    favs.items.has(u) ? favs.items.delete(u) : favs.items.add(u);
+  } else if (el.dataset.catStar){
+    const c = el.dataset.catStar;
+    favs.cats.has(c) ? favs.cats.delete(c) : favs.cats.add(c);
+  }
+  saveFavs();
+  const q = document.getElementById("search").value.trim();
+  renderChanges();
+  if (q.length >= 2) renderSearch(q);
+  else (view === "fav" ? renderFav : renderAll)();
+});
+
+(async function init(){
+  try {
+    rows = await loadCSV("data/latest_prices.csv");
+  } catch (e) {
+    document.getElementById("board").innerHTML =
+      '<div class="empty">No data yet. Run the scraper once (Actions tab), then reload.</div>';
+    document.getElementById("summary").textContent = "Waiting for first scrape";
+    return;
+  }
+  try {
+    for (const r of await loadCSV("data/previous_prices.csv"))
+      prevMap[r.url] = Number(r.price);
+  } catch (e) {}
+
+  byCat = {};
+  for (const r of rows) (byCat[r.category] = byCat[r.category] || []).push(r);
+  for (const cat in byCat)
+    byCat[cat].sort((a, b) => a.product.localeCompare(b.product) || a.price - b.price);
+
+  const sites = [...new Set(rows.map(r => r.site))];
+  document.getElementById("summary").textContent =
+    rows.length + " products · " + sites.length + " retailers · data from " + (rows[0]?.date || "");
+  document.getElementById("controls").style.display = "";
+
+  document.getElementById("viewFav").onclick = () => setView("fav");
+  document.getElementById("viewAll").onclick = () => setView("all");
+  document.getElementById("search").addEventListener("input", (e) => {
+    const q = e.target.value.trim();
+    clearTimeout(window.__t);
+    window.__t = setTimeout(() => q.length >= 2 ? renderSearch(q)
+      : (view === "fav" ? renderFav() : renderAll()), 200);
+  });
+
+  setView(favs.items.size || favs.cats.size ? "fav" : "all");
+})();
+</script>
+</body>
+</html>
