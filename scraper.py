@@ -1,5 +1,5 @@
 """
-Baseball competitor price scraper - v11.
+Baseball competitor price scraper - v12.
 
 Changes in this version:
   - Safety-net fix: previous data is de-duplicated before being counted, so
@@ -7,6 +7,8 @@ Changes in this version:
     it was (which caused fresh good data to be wrongly replaced in v10).
   - Only freshly scraped rows are appended to the history file.
   - The browser is shut down cleanly at the end of the run.
+  - Keeps a previous_prices.csv snapshot so the dashboard can show price
+    changes without reading the whole history file.
 """
 
 import csv
@@ -573,7 +575,11 @@ def write_output(rows):
         if not r.get("date"):
             r["date"] = today
 
-    for path in (out_dir / f"prices_{today}.csv", out_dir / "latest_prices.csv"):
+    latest_path = out_dir / "latest_prices.csv"
+    if latest_path.exists():
+        (out_dir / "previous_prices.csv").write_bytes(latest_path.read_bytes())
+
+    for path in (out_dir / f"prices_{today}.csv", latest_path):
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
