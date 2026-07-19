@@ -1,5 +1,5 @@
 """
-Baseball competitor price scraper - v12.
+Baseball competitor price scraper - v13.
 
 Changes in this version:
   - Safety-net fix: previous data is de-duplicated before being counted, so
@@ -9,6 +9,8 @@ Changes in this version:
   - The browser is shut down cleanly at the end of the run.
   - Keeps a previous_prices.csv snapshot so the dashboard can show price
     changes without reading the whole history file.
+  - Reading a page mid-redirect no longer crashes the fetch (retries until
+    the navigation settles).
 """
 
 import csv
@@ -190,7 +192,10 @@ def get_html(url, log_status=False):
             html, waited = "", 0
             for waited in range(1, 26):
                 time.sleep(1)
-                html = page.content()
+                try:
+                    html = page.content()
+                except Exception:
+                    continue                  # page is mid-redirect; try again
                 if "product-item" in html or "£" in html or "\u00a3" in html:
                     break                     # real storefront content is in
             if log_status:
