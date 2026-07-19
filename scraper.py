@@ -1,13 +1,12 @@
 """
-Baseball competitor price scraper - v10.
+Baseball competitor price scraper - v11.
 
 Changes in this version:
-  - Uses real Google Chrome when available (falls back to Chromium). These
-    bot checks fingerprint the browser deeply and real Chrome passes checks
-    that bare Chromium fails.
-  - The safety net now digs through price_history.csv for each site's last
-    good day, so data wiped from the dashboard by earlier failed runs is
-    restored automatically.
+  - Safety-net fix: previous data is de-duplicated before being counted, so
+    repeated same-day test runs can no longer make history look bigger than
+    it was (which caused fresh good data to be wrongly replaced in v10).
+  - Only freshly scraped rows are appended to the history file.
+  - The browser is shut down cleanly at the end of the run.
 """
 
 import csv
@@ -171,6 +170,8 @@ def _browser_page():
                        if route.request.resource_type == "image"
                        else route.continue_())
             _BROWSER_STATE["page"] = page
+            _BROWSER_STATE["pw"] = pw
+            _BROWSER_STATE["browser"] = browser
         except Exception as exc:
             print(f"  [browser] could not start: {exc}")
             _BROWSER_STATE["failed"] = True
@@ -580,11 +581,12 @@ def write_output(rows):
 
     history_path = out_dir / "price_history.csv"
     new_file = not history_path.exists()
+    fresh = [r for r in rows if r.get("date") == today]
     with open(history_path, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if new_file:
             writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(fresh)
     print(f"\nWrote {len(rows)} total rows to the data folder.")
 
 
@@ -601,11 +603,12 @@ def read_previous_latest():
             with open(path, newline="", encoding="utf-8-sig") as f:
                 for row in csv.DictReader(f):
                     key = (row.get("site", ""), row.get("date", ""))
-                    per_site_day.setdefault(key, []).append(row)
+                    per_site_day.setdefault(key, {})[row.get("url", "")] = row
         except Exception as exc:
             print(f"  ! could not read {filename}: {exc}")
     by_site = {}
-    for (site, day), rows in per_site_day.items():
+    for (site, day), row_map in per_site_day.items():
+        rows = list(row_map.values())
         if len(rows) < 5:
             continue           # a thin day is not a good day
         best = by_site.get(site)
@@ -640,6 +643,14 @@ def main():
             all_rows += old_rows
         else:
             all_rows += rows
+
+    try:
+        if _BROWSER_STATE.get("browser"):
+            _BROWSER_STATE["browser"].close()
+        if _BROWSER_STATE.get("pw"):
+            _BROWSER_STATE["pw"].stop()
+    except Exception:
+        pass
 
     if not all_rows:
         print("No data collected at all - something is wrong upstream.")
