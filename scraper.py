@@ -1,5 +1,5 @@
 """
-Baseball competitor price scraper - v13.
+Baseball competitor price scraper - v14.
 
 Changes in this version:
   - Safety-net fix: previous data is de-duplicated before being counted, so
@@ -11,6 +11,9 @@ Changes in this version:
     changes without reading the whole history file.
   - Reading a page mid-redirect no longer crashes the fetch (retries until
     the navigation settles).
+  - Products are de-duplicated by their product slug (the final part of the
+    URL), so the same item listed under both its category path and its brand
+    path only appears once. The shortest URL is kept.
 """
 
 import csv
@@ -90,6 +93,11 @@ def categorise(name, hint=""):
             if kw in text:
                 return category
     return "Other"
+
+
+def product_slug(url):
+    """The final path segment - identical for every URL the product lives at."""
+    return urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
 
 
 def clean_price(value):
@@ -290,10 +298,14 @@ def scrape_magento_categories(site_name, base_url, categories):
     def add(products, page_category):
         new = 0
         for name, price, url in products:
-            if url in rows:
+            key = product_slug(url)
+            existing = rows.get(key)
+            if existing is not None:
+                if len(url) < len(existing["url"]):
+                    existing["url"] = url        # keep the tidiest address
                 continue
             own = categorise(name)
-            rows[url] = {"site": site_name,
+            rows[key] = {"site": site_name,
                          "category": own if own != "Other" else page_category,
                          "product": name, "price": price, "url": url}
             new += 1
@@ -399,10 +411,14 @@ def scrape_baseball_outlet():
     def add(products):
         new = 0
         for name, price, url in products:
-            if url in rows:
+            key = product_slug(url)
+            existing = rows.get(key)
+            if existing is not None:
+                if len(url) < len(existing["url"]):
+                    existing["url"] = url        # keep the tidiest address
                 continue
             cat = categorise(name)
-            rows[url] = {"site": "Baseball Outlet", "category": cat,
+            rows[key] = {"site": "Baseball Outlet", "category": cat,
                          "product": name, "price": price, "url": url}
             new += 1
         return new
